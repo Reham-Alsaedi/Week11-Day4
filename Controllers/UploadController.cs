@@ -1,7 +1,6 @@
 using Microsoft.AspNetCore.Mvc;
 using System.Collections.Concurrent;
 using System.Threading.Channels;
-using static System.Runtime.InteropServices.JavaScript.JSType;
 
 [ApiController]
 [Route("[controller]")]
@@ -11,6 +10,8 @@ public class UploadController : ControllerBase
     private readonly IConfiguration _config;
     private readonly IWebHostEnvironment _env;
     private readonly ConcurrentDictionary<string, string> _statusMap;
+
+    private static readonly ConcurrentDictionary<string, List<DateTime>> UploadLog = new();
 
     public UploadController(Channel<FileUploadTask> uploadChannel, IConfiguration config,
                             IWebHostEnvironment env, ConcurrentDictionary<string, string> statusMap)
@@ -24,65 +25,79 @@ public class UploadController : ControllerBase
     [HttpPost("upload")]
     public async Task<IActionResult> Upload(IFormFile file)
     {
-        // check if the file length is greater than 10 * 1024 * 1024
-        //return BadRequest("File too large.");
+        if (file.Length > 10 * 1024 * 1024)
+            return BadRequest("File too large.");
 
-        // Rate Limiting Check
-        //var ip = HttpContext.Connection.RemoteIpAddress?.ToString();
-        //  if (IsRateLimitExceeded(ip))
-        //return "Rate limit exceeded. Please try again later."
+        var ip = HttpContext.Connection.RemoteIpAddress?.ToString();
+        if (IsRateLimitExceeded(ip))
+            return BadRequest("Rate limit exceeded. Please try again later.");
 
-        //  Executable File Check
-        // if (IsExecutableFile(file))
-        //return "Executable files are not allowed."
+        if (IsExecutableFile(file))
+            return BadRequest("Executable files are not allowed.");
 
-        // Generate UniqueID for tracking
         var id = Guid.NewGuid().ToString();
-        // SanitizeFileName
+        var sanitizedFileName = SanitizeFileName(file.FileName);
 
-        //Read all the file content here
+        using var ms = new MemoryStream();
+        await file.CopyToAsync(ms);
+        var content = ms.ToArray();
 
-        UploadStatusTracker.StatusMap[id] = "Pending";
+        _statusMap[id] = "Pending";
 
-        //Write the file to the stream so that it can be trackable
         await _uploadChannel.Writer.WriteAsync(new FileUploadTask
         {
-            //ProcessingId = id,
-            //FileContent = //Content of the file,
-            //OriginalFileName = sanitized,
-            //SimulateScan = //Read key "SimulateAntivirusScan" from appsettings to enable and disable the scan,
-            //ScanDelayMs = //Read key "ScanDelayMilliseconds" from appsettings to put the delay to simulate the virus scan,
-            //StoragePath = Path.Combine(_env.WebRootPath, "uploads") // Set the storage path
+            ProcessingId = id,
+            FileContent = content,
+            OriginalFileName = sanitizedFileName,
+            SimulateScan = _config.GetValue<bool>("FileUploadSettings:SimulateAntivirusScan"),
+            ScanDelayMs = _config.GetValue<int>("FileUploadSettings:ScanDelayMilliseconds"),
+            StoragePath = Path.Combine(_env.WebRootPath, "uploads")
         });
 
         return Ok(new { processingId = id });
     }
 
-
     [HttpGet("status/{id}")]
     public IActionResult Status(string id)
     {
-        //if (!_statusMap.TryGetValue(id, out var status))
-        //    return NotFound("Invalid ID");
-        //return Ok(new { status });
+        if (!_statusMap.TryGetValue(id, out var status))
+            return NotFound("Invalid ID");
+        return Ok(new { status });
     }
-
-    private static readonly Dictionary<string, List<DateTime>> UploadLog = new();
 
     private bool IsRateLimitExceeded(string ip, int maxUploads = 5, int intervalSeconds = 60)
     {
-        //Implement the logic that the request should not exceel the maxUploads under the intervalSeconds
+        if (string.IsNullOrEmpty(ip))
+            return false;
+
+        var now = DateTime.UtcNow;
+        var list = UploadLog.GetOrAdd(ip, _ => new List<DateTime>());
+
+        lock (list)
+        {
+            list.RemoveAll(t => (now - t).TotalSeconds > intervalSeconds);
+
+            if (list.Count >= maxUploads)
+                return true;
+
+            list.Add(now);
+            return false;
+        }
     }
 
     private bool IsExecutableFile(IFormFile file)
     {
-        //using var reader = new BinaryReader(file.OpenReadStream());
-        //var headerBytes = reader.ReadBytes(4);
-        //return headerBytes.Take(2).SequenceEqual(new byte[] { 0x4D, 0x5A });
+        using var reader = new BinaryReader(file.OpenReadStream());
+        var headerBytes = reader.ReadBytes(2);
+        return headerBytes.SequenceEqual(new byte[] { 0x4D, 0x5A }); // "MZ"
     }
 
     private string SanitizeFileName(string fileName)
     {
-       // .Replace("..", "").Replace("//", "").Replace("\\", "").Replace(":", "");
+        return Path.GetFileName(fileName)
+                   .Replace("..", "")
+                   .Replace("//", "")
+                   .Replace("\\", "")
+                   .Replace(":", "");
     }
 }
